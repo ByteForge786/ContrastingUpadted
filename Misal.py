@@ -1,3 +1,81 @@
+# First, let's modify the ContrastiveModel class to remove MLP
+class ContrastiveModel(nn.Module):
+    """Model using only the sentence transformer encoder."""
+    def __init__(self, config: TrainingConfig):
+        super().__init__()
+        self.config = config
+        self.encoder = SentenceTransformer(config.model_name)
+        
+        # Freeze encoder if in MLP mode
+        if config.train_mode == 'mlp':
+            for param in self.encoder.parameters():
+                param.requires_grad = False
+    
+    def forward(self, texts: List[str]) -> torch.Tensor:
+        # Get embeddings and normalize them
+        embeddings = self.encoder.encode(
+            texts,
+            convert_to_tensor=True,
+            show_progress_bar=False
+        )
+        
+        # Normalize outputs
+        outputs = F.normalize(embeddings, p=2, dim=1)
+        return outputs
+
+# Now modify the training loop to use explicit negatives
+def _train_epoch(self, train_loader: DataLoader, epoch: int) -> float:
+    """Train for one epoch using explicit negatives."""
+    self.model.train()
+    total_loss = 0
+    
+    with tqdm(train_loader, desc=f"Epoch {epoch + 1}") as pbar:
+        for batch_idx, (anchors, positives, negatives) in enumerate(pbar):
+            # Get embeddings
+            anchor_embeds = self.model(anchors)
+            positive_embeds = self.model(positives)
+            negative_embeds = self.model(negatives)
+            
+            # Compute loss
+            loss = self.criterion(anchor_embeds, positive_embeds, negative_embeds)
+            
+            # Backward and optimize
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+            
+            # Update metrics
+            total_loss += loss.item()
+            pbar.set_postfix({'loss': total_loss / (batch_idx + 1)})
+            
+    return total_loss / len(train_loader)
+
+# And update the validation function similarly
+def _validate(self, val_loader: DataLoader) -> float:
+    """Validate the model using explicit negatives."""
+    self.model.eval()
+    total_loss = 0
+    
+    with torch.no_grad():
+        for anchors, positives, negatives in val_loader:
+            # Get embeddings
+            anchor_embeds = self.model(anchors)
+            positive_embeds = self.model(positives)
+            negative_embeds = self.model(negatives)
+            
+            # Compute loss
+            loss = self.criterion(anchor_embeds, positive_embeds, negative_embeds)
+            total_loss += loss.item()
+            
+    return total_loss / len(val_loader)
+
+
+
+
+
+
+
+
 def evaluate_test(self, test_data: Dict, output_dir: str) -> None:
     """Evaluate model on test set and save metrics."""
     self.logger.info("Evaluating on test set...")
