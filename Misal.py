@@ -1,3 +1,445 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from sentence_transformers import SentenceTransformer
+import pandas as pd
+import numpy as np
+import logging
+from pathlib import Path
+import os
+import sys
+from datetime import datetime
+from typing import List, Tuple, Dict, Any, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
+import argparse
+import json
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
+class SiameseNetwork(nn.Module):
+    def __init__(self, model_name: str = 'sentence-transformers/all-mpnet-base-v2'):
+        super().__init__()
+        # Load pretrained transformer model
+        self.encoder = SentenceTransformer(model_name)
+        
+        # Get embedding dimension
+        embedding_dim = self.encoder.get_sentence_embedding_dimension()
+        
+        # Custom similarity network for batch processing
+        self.similarity_network = nn.Sequential(
+            nn.Linear(embedding_dim * 2, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, 1),
+            nn.Sigmoid()
+        )
+    
+    def encode_batch(self, texts: List[str]) -> torch.Tensor:
+        """
+        Batch encoding with parallel processing
+        Ensures gradient computation and handles large batches efficiently
+        """
+        # Encode texts with batch processing
+        embeddings = self.encoder.encode(
+            texts, 
+            convert_to_tensor=True,
+            batch_size=len(texts),  # Use full batch size
+            show_progress_bar=False
+        )
+        
+        # Normalize embeddings
+        return F.normalize(embeddings, p=2, dim=1)
+    
+    def forward(self, text1: List[str], text2: List[str]) -> torch.Tensor:
+        # Batch encode both sets of texts
+        batch_embeddings1 = self.encode_batch(text1)
+        batch_embeddings2 = self.encode_batch(text2)
+        
+        # Combine embeddings
+        combined = torch.cat([batch_embeddings1, batch_embeddings2], dim=1)
+        
+        # Compute similarity using learned network
+        similarities = self.similarity_network(combined).squeeze()
+        
+        return similarities
+
+class BatchSiameseDataset(torch.utils.data.Dataset):
+    """
+    Enhanced dataset with batch-aware pair creation
+    Supports efficient batch processing and parallel pair generation
+    """
+    def __init__(
+        self, 
+        attributes_df: pd.DataFrame,
+        concepts_df: pd.DataFrame,
+        batch_size: int = 64,
+        num_workers: int = 4
+    ):
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        
+        # Parallel pair creation with efficient memory management
+        self.pairs, self.labels = self._create_pairs_parallel(
+            attributes_df, 
+            concepts_df
+        )
+    
+    def _create_pairs_parallel(
+        self, 
+        attributes_df: pd.DataFrame, 
+        concepts_df: pd.DataFrame
+    ) -> Tuple[List[Tuple[str, str]], List[float]]:
+        """
+        Parallel pair creation with efficient chunk processing
+        """
+        def process_chunk(attr_chunk, concepts_df):
+            chunk_pairs = []
+            chunk_labels = []
+            
+            for _, attr_row in attr_chunk.iterrows():
+                attribute_text = f"{attr_row['attribute_name']} {attr_row['description']}"
+                
+                for _, concept_row in concepts_df.iterrows():
+                    concept_text = (
+                        f"{concept_row['domain']}-{concept_row['concept']}: "
+                        f"{concept_row['concept_definition']}"
+                    )
+                    
+                    # Label based on domain and concept match
+                    label = 1.0 if (
+                        attr_row['domain'] == concept_row['domain'] and 
+                        attr_row['concept'] == concept_row['concept']
+                    ) else 0.0
+                    
+                    chunk_pairs.append((attribute_text, concept_text))
+                    chunk_labels.append(label)
+            
+            return chunk_pairs, chunk_labels
+        
+        # Split attributes into chunks for parallel processing
+        chunks = np.array_split(attributes_df, self.num_workers)
+        
+        # Use ThreadPoolExecutor for parallel pair generation
+        all_pairs = []
+        all_labels = []
+        
+        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+            futures = [
+                executor.submit(process_chunk, chunk, concepts_df) 
+                for chunk in chunks
+            ]
+            
+            for future in as_completed(futures):
+                pairs, labels = future.result()
+                all_pairs.extend(pairs)
+                all_labels.extend(labels)
+        
+        return all_pairs, all_labels
+    
+    def __len__(self) -> int:
+        return len(self.pairs)
+    
+    def __getitem__(self, idx: int) -> Tuple[str, str, float]:
+        return (*self.pairs[idx], self.labels[idx])
+
+class BatchModelTrainer:
+    def __init__(
+        self, 
+        model_name: str = 'sentence-transformers/all-mpnet-base-v2',
+        batch_size: int = 64,
+        num_epochs: int = 15,
+        learning_rate: float = 1e-4,
+        weight_decay: float = 1e-5,
+        output_dir: str = './model_output'
+    ):
+        # Setup logging
+        self.logger = logging.getLogger(__name__)
+        
+        # Setup model with batch-aware architecture
+        self.model = SiameseNetwork(model_name)
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model.to(self.device)
+        
+        # Optimizer and scheduler for batch training
+        self.optimizer = torch.optim.AdamW(
+            self.model.parameters(), 
+            lr=learning_rate, 
+            weight_decay=weight_decay
+        )
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, 
+            mode='max', 
+            factor=0.5, 
+            patience=3
+        )
+        
+        # Training hyperparameters
+        self.batch_size = batch_size
+        self.num_epochs = num_epochs
+        self.output_dir = output_dir
+        
+        # Create output directory
+        os.makedirs(output_dir, exist_ok=True)
+    
+    def train_batch(self, dataloader, criterion):
+        """
+        Batch-aware training method
+        Supports efficient gradient computation and tracking
+        """
+        self.model.train()
+        total_loss = 0
+        correct_predictions = 0
+        total_predictions = 0
+        
+        for batch_text1, batch_text2, batch_labels in tqdm(dataloader, desc="Training"):
+            # Move data to device
+            batch_labels = batch_labels.float().to(self.device)
+            
+            # Zero gradients
+            self.optimizer.zero_grad()
+            
+            # Forward pass with batch processing
+            similarities = self.model(batch_text1, batch_text2)
+            
+            # Compute loss
+            loss = criterion(similarities, batch_labels)
+            
+            # Backward pass
+            loss.backward()
+            self.optimizer.step()
+            
+            # Update metrics
+            total_loss += loss.item()
+            predictions = (similarities > 0.5).float()
+            correct_predictions += (predictions == batch_labels).sum().item()
+            total_predictions += len(batch_labels)
+        
+        # Compute average metrics
+        avg_loss = total_loss / len(dataloader)
+        accuracy = correct_predictions / total_predictions
+        
+        return avg_loss, accuracy
+
+    def train(self, attributes_df: pd.DataFrame, concepts_df: pd.DataFrame):
+        """
+        Comprehensive training method with batch optimization
+        """
+        # Create batch-aware dataset
+        dataset = BatchSiameseDataset(
+            attributes_df,
+            concepts_df,
+            batch_size=self.batch_size
+        )
+        
+        # Create dataloader with batch processing
+        dataloader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=4,
+            pin_memory=True
+        )
+        
+        # Loss function
+        criterion = nn.BCELoss()
+        
+        # Best model tracking
+        best_accuracy = 0
+        
+        # Training loop
+        for epoch in range(self.num_epochs):
+            avg_loss, accuracy = self.train_batch(dataloader, criterion)
+            
+            # Learning rate scheduling
+            self.scheduler.step(accuracy)
+            
+            # Log epoch results
+            self.logger.info(f"Epoch {epoch+1}: Loss = {avg_loss:.4f}, Accuracy = {accuracy:.4f}")
+            
+            # Save best model
+            if accuracy > best_accuracy:
+                best_accuracy = accuracy
+                best_model_path = os.path.join(self.output_dir, 'best_model')
+                os.makedirs(best_model_path, exist_ok=True)
+                
+                # Save model
+                torch.save({
+                    'model_state_dict': self.model.state_dict(),
+                    'optimizer_state_dict': self.optimizer.state_dict(),
+                    'accuracy': accuracy,
+                    'epoch': epoch
+                }, os.path.join(best_model_path, 'model_checkpoint.pt'))
+                
+                # Save encoder
+                self.model.encoder.save(best_model_path)
+                
+                self.logger.info(f"New best model saved with accuracy {accuracy:.4f}")
+        
+        # Save final model
+        final_model_path = os.path.join(self.output_dir, 'final_model')
+        os.makedirs(final_model_path, exist_ok=True)
+        torch.save({
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'accuracy': best_accuracy
+        }, os.path.join(final_model_path, 'model_checkpoint.pt'))
+        self.model.encoder.save(final_model_path)
+        
+        self.logger.info(f"Training completed. Best accuracy: {best_accuracy:.4f}")
+        return best_accuracy
+
+class ModelPredictor:
+    def __init__(
+        self, 
+        model_path: str, 
+        batch_size: int = 64, 
+        top_k: int = 3
+    ):
+        # Setup logging
+        self.logger = logging.getLogger(__name__)
+        
+        # Load model
+        self.model = SiameseNetwork()
+        self.model.encoder = SentenceTransformer(model_path)
+        
+        # Load model state
+        checkpoint = torch.load(os.path.join(model_path, 'model_checkpoint.pt'))
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        
+        # Device setup
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model.to(self.device)
+        self.model.eval()
+        
+        # Prediction parameters
+        self.batch_size = batch_size
+        self.top_k = top_k
+    
+    def predict_batch(self, attributes_df: pd.DataFrame, concept_texts: List[str]):
+        """
+        Batch prediction with parallel processing
+        """
+        results = []
+        
+        # Process in batches
+        for i in range(0, len(attributes_df), self.batch_size):
+            batch_df = attributes_df.iloc[i:i+self.batch_size]
+            
+            # Prepare texts
+            attribute_texts = [
+                f"{row['attribute_name']} {row['description']}" 
+                for _, row in batch_df.iterrows()
+            ]
+            
+            # Batch prediction
+            with torch.no_grad():
+                similarities = self.model(
+                    attribute_texts, 
+                    concept_texts * len(attribute_texts)
+                )
+                
+                # Reshape similarities
+                similarities = similarities.view(
+                    len(attribute_texts), 
+                    len(concept_texts)
+                )
+            
+            # Process predictions for each attribute
+            for attr_similarities in similarities:
+                # Get top-k predictions
+                top_indices = torch.topk(attr_similarities, self.top_k).indices
+                
+                batch_results = []
+                for idx in top_indices:
+                    concept_text = concept_texts[idx]
+                    domain, concept = concept_text.split(':')[0].split('-')
+                    confidence = attr_similarities[idx].item()
+                    
+                    batch_results.append({
+                        'domain': domain,
+                        'concept': concept,
+                        'confidence': confidence
+                    })
+                
+                results.append(batch_results)
+        
+        return results
+
+def main():
+    # Argument parsing
+    parser = argparse.ArgumentParser(description='Batch Siamese Network Training and Prediction')
+    parser.add_argument('--mode', choices=['train', 'predict'], required=True)
+    parser.add_argument('--attributes', type=str, required=True, help='Path to attributes CSV')
+    parser.add_argument('--concepts', type=str, required=True, help='Path to concepts CSV')
+    parser.add_argument('--output-dir', type=str, default='./output')
+    parser.add_argument('--model-path', type=str, help='Path to saved model (for prediction)')
+    parser.add_argument('--batch-size', type=int, default=64)
+    parser.add_argument('--epochs', type=int, default=15)
+    
+    args = parser.parse_args()
+    
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    logger = logging.getLogger(__name__)
+    
+    try:
+        # Load data
+        attributes_df = pd.read_csv(args.attributes)
+        concepts_df = pd.read_csv(args.concepts)
+        
+        if args.mode == 'train':
+            # Training mode
+            trainer = BatchModelTrainer(
+                batch_size=args.batch_size,
+                num_epochs=args.epochs,
+                output_dir=args.output_dir
+            )
+            
+            # Train the model
+            trainer.train(attributes_df, concepts_df)
+            
+        elif args.mode == 'predict':
+            # Prediction mode
+            if not args.model_path:
+                raise ValueError("Model path is required for prediction")
+            
+            # Prepare concept texts
+            concept_texts = [
+                f"{row['domain']}-{row['concept']}: {row['concept_definition']}"
+                for _, row in concepts_df.iterrows()
+            ]
+            
+            # Initialize predictor
+            predictor = ModelPredictor(
+
+
+
+
+
+
+
+
+
+
+
+
 class SiameseNetwork(nn.Module):
     def __init__(self, model_name: str = 'sentence-transformers/all-mpnet-base-v2'):
         super().__init__()
