@@ -1,5 +1,33 @@
 # First, let's modify the ContrastiveModel class to remove MLP
 
+def _validate(self, val_loader: DataLoader) -> float:
+    """Validate the model."""
+    self.model.eval()
+    total_loss = 0
+    
+    with torch.no_grad():
+        for anchors, others, labels in val_loader:
+            # Move tensors to device
+            anchors = anchors.to(self.device)
+            others = others.to(self.device)
+            labels = labels.to(self.device)
+            
+            # Get embeddings
+            anchor_embeds = self.model(anchors)
+            other_embeds = self.model(others)
+            
+            # Get positives and negatives based on labels
+            positives = other_embeds[labels == 1]
+            anchors_pos = anchor_embeds[labels == 1]
+            negatives = other_embeds[labels == 0]
+            
+            if len(positives) > 0 and len(negatives) > 0:
+                # Compute loss
+                loss = self.criterion(anchors_pos, positives, negatives)
+                total_loss += loss.item()
+                
+    return total_loss / len(val_loader)
+
 def _train_epoch(self, train_loader: DataLoader, epoch: int) -> float:
     """Train for one epoch using explicit negatives."""
     self.model.train()
