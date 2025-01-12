@@ -8,9 +8,9 @@ import logging
 from pathlib import Path
 import os
 from datetime import datetime
-from typing import List, Tuple, Dict, Any, Optional, Union
+from typing import List, Tuple, Dict, Any, Optional, Set
 from dataclasses import dataclass
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 import argparse
 import yaml
@@ -18,35 +18,22 @@ import json
 import sys
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
-from torch.cuda.amp import autocast, GradScaler
+from functools import lru_cache
+import multiprocessing
+from collections import defaultdict
 
-# Setup logging with more detailed format
+# Setup logging with process info
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s',
+    format='%(asctime)s - %(processName)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler('model_training.log')
+        logging.StreamHandler(sys.stdout)
     ]
 )
 logger = logging.getLogger(__name__)
 
-# Add performance monitoring
-import time
-class Timer:
-    def __init__(self, name):
-        self.name = name
-        self.start_time = None
-    
-    def __enter__(self):
-        self.start_time = time.time()
-        return self
-    
-    def __exit__(self, *args):
-        end_time = time.time()
-        duration = end_time - self.start_time
-        logger.info(f"{self.name} took {duration:.2f} seconds")
+# Optimize torch operations
+torch.backends.cudnn.benchmark = True
 
 @dataclass
 class PredictionResult:
@@ -66,6 +53,14 @@ class TrainingBatch:
     positives: List[str]
     negatives: List[str]
     negative_weights: List[float]
+
+    def to_device(self, device: torch.device):
+        return {
+            'anchors': [a.to(device) for a in self.anchors],
+            'positives': [p.to(device) for p in self.positives],
+            'negatives': [n.to(device) for n in self.negatives],
+            'negative_weights': torch.tensor(self.negative_weights, device=device)
+        }
 
 @dataclass
 class TrainingStats:
@@ -125,12 +120,10 @@ class EarlyStopping:
 class MetricsTracker:
     def __init__(self, output_dir: str):
         self.output_dir = Path(output_dir)
-        self.metrics: Dict[str, List[float]] = {}
+        self.metrics: Dict[str, List[float]] = defaultdict(list)
         self.epoch_metrics: Dict[str, float] = {}
         
     def add_metric(self, name: str, value: float, epoch: Optional[int] = None) -> None:
-        if name not in self.metrics:
-            self.metrics[name] = []
         self.metrics[name].append(value)
         
         if epoch is not None:
@@ -141,7 +134,7 @@ class MetricsTracker:
             output_path = self.output_dir / filename
             with open(output_path, 'w') as f:
                 json.dump({
-                    'metrics': self.metrics,
+                    'metrics': dict(self.metrics),
                     'epoch_metrics': self.epoch_metrics,
                     'timestamp': datetime.now().isoformat()
                 }, f, indent=2)
@@ -149,57 +142,49 @@ class MetricsTracker:
         except Exception as e:
             logger.error(f"Error saving metrics: {str(e)}")
 
-class ConceptDataset(Dataset):
-    def __init__(self, sampling_results: List[TrainingBatch]):
-        self.batches = sampling_results
-        
-    def __len__(self) -> int:
-        return len(self.batches)
-        
-    def __getitem__(self, idx: int) -> TrainingBatch:
-        return self.batches[idx]
-
 class DataProcessor:
-    def __init__(self, attributes_path: str, concepts_path: str, test_size: float = 0.2, 
-                 random_state: int = 42, num_workers: int = 4):
+    def __init__(self, attributes_path: str, concepts_path: str, test_size: float = 0.2, random_state: int = 42):
         self.attributes_path = Path(attributes_path)
         self.concepts_path = Path(concepts_path)
         self.test_size = test_size
         self.random_state = random_state
-        self.num_workers = num_workers
         self.logger = logging.getLogger(__name__)
         
-        # Initialize caches
+        # Use more efficient data structures
         self.attributes_df = None
         self.concepts_df = None
-        self.domain_concepts = {}
-        self.concept_definitions_cache = {}
+        self.domain_concepts: Dict[str, Set[str]] = defaultdict(set)
+        
+        # Cache for concept definitions
+        self._concept_def_cache: Dict[Tuple[str, str], str] = {}
+        
+        # Split indices
         self.train_indices = None
         self.val_indices = None
         
-        with Timer("Data Loading"):
-            self.load_data()
+        self.load_data()
 
     def load_data(self) -> None:
         try:
-            self.logger.info("Loading and preprocessing data...")
-            
             # Load data in parallel
-            with ThreadPoolExecutor(max_workers=2) as executor:
+            with ThreadPoolExecutor() as executor:
                 attr_future = executor.submit(pd.read_csv, self.attributes_path)
-                concepts_future = executor.submit(pd.read_csv, self.concepts_path)
+                concept_future = executor.submit(pd.read_csv, self.concepts_path)
                 
                 self.attributes_df = attr_future.result()
-                self.concepts_df = concepts_future.result()
-            
+                self.concepts_df = concept_future.result()
+
             # Validate columns
             required_attr_cols = ['attribute_name', 'description', 'domain', 'concept']
             required_concept_cols = ['domain', 'concept', 'concept_definition']
             
             self._validate_columns(self.attributes_df, required_attr_cols, 'attributes')
             self._validate_columns(self.concepts_df, required_concept_cols, 'concepts')
-            
-            # Create train/validation split with stratification
+
+            # Optimize dataframe
+            self._optimize_dataframes()
+
+            # Create train/validation split
             all_indices = np.arange(len(self.attributes_df))
             self.train_indices, self.val_indices = train_test_split(
                 all_indices,
@@ -207,14 +192,12 @@ class DataProcessor:
                 random_state=self.random_state,
                 stratify=self.attributes_df['domain'].values
             )
-            
-            # Build caches in parallel
-            with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
-                executor.submit(self._build_domain_concepts_cache)
-                executor.submit(self._build_concept_definitions_cache)
+
+            # Build domain-concept cache efficiently
+            self._build_domain_concepts_cache()
             
             self.logger.info(
-                f"Loaded {len(self.attributes_df)} attributes and {len(self.concepts_df)} concepts. "
+                f"Loaded {len(self.attributes_df)} attributes and {len(self.concepts_df)} concept definitions. "
                 f"Split into {len(self.train_indices)} train and {len(self.val_indices)} validation samples"
             )
         
@@ -222,34 +205,40 @@ class DataProcessor:
             self.logger.error(f"Error loading data: {str(e)}")
             raise
 
+    def _optimize_dataframes(self):
+        """Optimize memory usage of dataframes."""
+        for df in [self.attributes_df, self.concepts_df]:
+            for col in df.select_dtypes(include=['object']).columns:
+                df[col] = pd.Categorical(df[col])
+
     def _validate_columns(self, df: pd.DataFrame, required_cols: List[str], df_name: str) -> None:
         missing_cols = [col for col in required_cols if col not in df.columns]
         if missing_cols:
             raise ValueError(f"Missing required columns in {df_name} CSV: {missing_cols}")
 
     def _build_domain_concepts_cache(self) -> None:
-        for _, row in self.concepts_df.iterrows():
-            if row['domain'] not in self.domain_concepts:
-                self.domain_concepts[row['domain']] = set()
+        """Build domain-concepts cache using vectorized operations."""
+        domain_concept_pairs = self.concepts_df[['domain', 'concept']].drop_duplicates()
+        for _, row in domain_concept_pairs.iterrows():
             self.domain_concepts[row['domain']].add(row['concept'])
-        
-        self.logger.info(f"Built domain concepts cache with {len(self.domain_concepts)} domains")
-
-    def _build_concept_definitions_cache(self) -> None:
+            
+        # Pre-cache concept definitions
         for _, row in self.concepts_df.iterrows():
-            key = (row['domain'], row['concept'])
-            self.concept_definitions_cache[key] = row['concept_definition']
+            self._concept_def_cache[(row['domain'], row['concept'])] = row['concept_definition']
         
-        self.logger.info(f"Built concept definitions cache with {len(self.concept_definitions_cache)} entries")
+        self.logger.info(f"Found {len(self.domain_concepts)} domains with unique concepts")
 
-    def get_attribute_text(self, row: pd.Series) -> str:
-        return f"{row['attribute_name']} {row['description']}"
+    @lru_cache(maxsize=1024)
+    def get_attribute_text(self, attribute_name: str, description: str) -> str:
+        """Cached attribute text generation."""
+        return f"{attribute_name} {description}"
 
     def get_concept_definition(self, domain: str, concept: str) -> str:
-        key = (domain, concept)
-        if key not in self.concept_definitions_cache:
+        """Get concept definition from cache."""
+        cache_key = (domain, concept)
+        if cache_key not in self._concept_def_cache:
             raise ValueError(f"No definition found for domain={domain}, concept={concept}")
-        return self.concept_definitions_cache[key]
+        return self._concept_def_cache[cache_key]
 
     def get_domains(self) -> List[str]:
         return list(self.domain_concepts.keys())
@@ -263,255 +252,264 @@ class DataProcessor:
     def get_val_attributes(self) -> pd.DataFrame:
         return self.attributes_df.iloc[self.val_indices]
 
-class PairSampler:
-    def __init__(self, data_processor: DataProcessor, batch_size: int = 32, num_workers: int = 4):
+class BatchedPairSampler:
+    def __init__(self, data_processor: DataProcessor, batch_size: int = 32):
         self.data_processor = data_processor
         self.batch_size = batch_size
-        self.num_workers = num_workers
         self.logger = logging.getLogger(__name__)
         
         # Initialize sentence transformer for similarity computation
-        self.model = SentenceTransformer('all-mpnet-base-v2')
+        self.model = SentenceTransformer('sentence-transformers/all-mpnet-base-v2')
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model.to(self.device)
 
-    def compute_description_similarity(self, desc1: str, desc2: str) -> float:
+    def compute_batch_similarities(self, texts1: List[str], texts2: List[str]) -> torch.Tensor:
+        """Compute similarities for batches of texts."""
         with torch.no_grad():
-            embeddings1 = self.model.encode(desc1, convert_to_tensor=True)
-            embeddings2 = self.model.encode(desc2, convert_to_tensor=True)
-            similarity = F.cosine_similarity(embeddings1, embeddings2, dim=0).item()
-        return similarity
+            embeddings1 = self.model.encode(texts1, convert_to_tensor=True, batch_size=self.batch_size)
+            embeddings2 = self.model.encode(texts2, convert_to_tensor=True, batch_size=self.batch_size)
+            
+            # Normalize embeddings
+            embeddings1 = F.normalize(embeddings1, p=2, dim=1)
+            embeddings2 = F.normalize(embeddings2, p=2, dim=1)
+            
+            # Compute similarities
+            similarities = torch.mm(embeddings1, embeddings2.t())
+            
+        return similarities
 
-    def _sample_hard_negatives(self, domain: str, concept: str, 
+    def sample_pairs(self, domain: str, concept: str, is_training: bool = True) -> SamplingResult:
+        try:
+            # Get attributes based on split
+            attributes_df = (
+                self.data_processor.get_train_attributes() if is_training 
+                else self.data_processor.get_val_attributes()
+            )
+            
+            # Get all positive attributes efficiently
+            mask = (attributes_df['domain'] == domain) & (attributes_df['concept'] == concept)
+            positive_attrs = attributes_df[mask]
+            
+            if len(positive_attrs) == 0:
+                raise ValueError(f"No attributes found for domain={domain}, concept={concept}")
+
+            concept_def = self.data_processor.get_concept_definition(domain, concept)
+            
+            # Create positive pairs efficiently
+            positive_pairs = [
+                (self.data_processor.get_attribute_text(row['attribute_name'], row['description']), concept_def)
+                for _, row in positive_attrs.iterrows()
+            ]
+            
+            n_required_negatives = len(positive_pairs)
+            
+            # Sample negatives in parallel
+            with ThreadPoolExecutor() as executor:
+                hard_future = executor.submit(
+                    self._sample_hard_negatives,
+                    domain, concept, positive_attrs,
+                    int(0.4 * n_required_negatives), attributes_df
+                )
+                
+                medium_future = executor.submit(
+                    self._sample_medium_negatives,
+                    domain, concept,
+                    n_required_negatives - int(0.4 * n_required_negatives),
+                    attributes_df
+                )
+                
+                hard_negatives = hard_future.result()
+                medium_negatives = medium_future.result()
+            
+            # Combine all negatives
+            negative_pairs = hard_negatives + medium_negatives
+            
+            stats = {
+                'n_positives': len(positive_pairs),
+                'n_hard_negatives': len(hard_negatives),
+                'n_medium_negatives': len(medium_negatives)
+            }
+            
+            return SamplingResult(positive_pairs, negative_pairs, stats)
+            
+        except Exception as e:
+            self.logger.error(f"Error sampling pairs for {domain}-{concept}: {str(e)}")
+            raise
+
+    def _sample_hard_negatives(self, domain: str, concept: str,
                              positive_attrs: pd.DataFrame, n_required: int,
                              attributes_df: pd.DataFrame) -> List[Tuple[str, str, float]]:
+        """Sample hard negatives using batched operations."""
         hard_negatives = []
+        other_concepts = [c for c in self.data_processor.get_concepts_for_domain(domain) 
+                         if c != concept]
         
-        # Get all potential negatives
-        other_mask = attributes_df['domain'] != domain | \
-                     (attributes_df['domain'] == domain & attributes_df['concept'] != concept)
-        potential_negatives = attributes_df[other_mask]
-        
-        # Calculate similarities
-        all_similarities = []
-        all_rows = []
-        
-        # Compute similarities between each positive and potential negative
-        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
-            futures = []
-            for _, pos_row in positive_attrs.iterrows():
-                pos_desc = pos_row['description']
-                for _, neg_row in potential_negatives.iterrows():
-                    futures.append(
-                        executor.submit(
-                            self.compute_description_similarity,
-                            pos_desc,
-                            neg_row['description']
-                        )
-                    )
-                    all_rows.append(neg_row)
-                    
-            # Collect similarities
-            similarities = [f.result() for f in futures]
-            all_similarities.extend(similarities)
+        if not other_concepts:
+            return hard_negatives
             
-        # Create array for easier filtering    
-        similarities_array = np.array(all_similarities)
-        high_sim_indices = np.where(similarities_array > 0.8)[0]
+        # Get potential negative attributes efficiently
+        mask = (attributes_df['domain'] == domain) & (attributes_df['concept'].isin(other_concepts))
+        potential_negatives = attributes_df[mask]
         
-        # Sort by similarity to get hardest negatives first
-        sorted_indices = high_sim_indices[np.argsort(-similarities_array[high_sim_indices])]
-        
-        # Take top n_required high similarity negatives
-        for idx in sorted_indices[:n_required]:
-            row = all_rows[idx]
-            neg_text = self.data_processor.get_attribute_text(row)
-            neg_def = self.data_processor.get_concept_definition(row['domain'], row['concept'])
+        if len(potential_negatives) == 0:
+            return hard_negatives
             
-            # Weight based on domain
-            weight = 1.5 if row['domain'] == domain else 1.3
-            hard_negatives.append((neg_text, neg_def, weight))
+        # Prepare texts for batch processing
+        pos_texts = [
+            row['description'] for _, row in positive_attrs.iterrows()
+        ]
+        neg_texts = [
+            row['description'] for _, row in potential_negatives.iterrows()
+        ]
+        
+        # Compute similarities in batches
+        batch_size = min(128, len(pos_texts))
+        similarities = []
+        
+        for i in range(0, len(pos_texts), batch_size):
+            pos_batch = pos_texts[i:i+batch_size]
+            sim_batch = self.compute_batch_similarities(pos_batch, neg_texts)
+            similarities.append(sim_batch)
+            
+        # Combine similarities
+        similarities = torch.cat(similarities, dim=0)
+        
+        # Find high similarity pairs
+        high_sim_indices = torch.nonzero(similarities > 0.8)
+        
+        # Create hard negatives
+        for pos_idx, neg_idx in high_sim_indices[:n_required]:
+            neg_row = potential_negatives.iloc[neg_idx]
+            neg_text = self.data_processor.get_attribute_text(
+                neg_row['attribute_name'],
+                neg_row['description']
+            )
+            neg_def = self.data_processor.get_concept_definition(domain, neg_row['concept'])
+            hard_negatives.append((neg_text, neg_def, 1.5))
             
         return hard_negatives
 
-    def _sample_medium_negatives(self, domain: str, concept: str, 
+    def _sample_medium_negatives(self, domain: str, concept: str,
                                n_required: int, attributes_df: pd.DataFrame) -> List[Tuple[str, str, float]]:
-        """Sample medium negatives from different domains using parallel processing."""
+        """Sample medium negatives efficiently."""
         medium_negatives = []
         other_domains = [d for d in self.data_processor.get_domains() if d != domain]
         
         if not other_domains:
-            self.logger.warning("No other domains found for medium negatives")
             return medium_negatives
             
+        # Batch sample from other domains
         sample_domains = np.random.choice(other_domains, n_required, replace=True)
+        domain_batches = defaultdict(list)
         
-        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
-            futures = []
+        # Group by domain for efficient processing
+        for d in sample_domains:
+            domain_batches[d].append(d)
             
-            for d in sample_domains:
-                concepts = self.data_processor.get_concepts_for_domain(d)
-                if not concepts:
-                    continue
-                    
-                c = np.random.choice(list(concepts))
-                futures.append(
-                    executor.submit(
-                        self._get_medium_negative,
-                        d, c, attributes_df
-                    )
+        # Process each domain batch
+        for d, batch in domain_batches.items():
+            concepts = self.data_processor.get_concepts_for_domain(d)
+            if not concepts:
+                continue
+                
+            # Sample concepts for entire batch
+            batch_concepts = np.random.choice(list(concepts), len(batch))
+            
+            # Get attributes efficiently
+            mask = (attributes_df['domain'] == d) & (attributes_df['concept'].isin(set(batch_concepts)))
+            neg_attrs = attributes_df[mask]
+            
+            if len(neg_attrs) == 0:
+                continue
+                
+            # Sample attributes for batch
+            sampled_indices = np.random.randint(0, len(neg_attrs), len(batch))
+            sampled_attrs = neg_attrs.iloc[sampled_indices]
+            
+            for _, row in sampled_attrs.iterrows():
+                neg_text = self.data_processor.get_attribute_text(
+                    row['attribute_name'],
+                    row['description']
                 )
-            
-            for future in futures:
-                result = future.result()
-                if result is not None:
-                    medium_negatives.append(result)
-                    
+                neg_def = self.data_processor.get_concept_definition(d, row['concept'])
+                medium_negatives.append((neg_text, neg_def, 1.0))
+                
                 if len(medium_negatives) >= n_required:
-                    break
+                    return medium_negatives[:n_required]
                     
-        return medium_negatives[:n_required]
+        return medium_negatives
 
-    def _get_medium_negative(self, domain: str, concept: str, 
-                           attributes_df: pd.DataFrame) -> Optional[Tuple[str, str, float]]:
-        """Helper method to get a single medium negative example."""
-        mask = (attributes_df['domain'] == domain) & \
-               (attributes_df['concept'] == concept)
-        neg_attrs = attributes_df[mask]
+class OptimizedDataset(Dataset):
+    def __init__(self, sampling_results: List[TrainingBatch], device: torch.device):
+        self.batches = sampling_results
+        self.device = device
         
-        if len(neg_attrs) == 0:
-            return None
-            
-        neg_row = neg_attrs.iloc[np.random.randint(len(neg_attrs))]
-        neg_text = self.data_processor.get_attribute_text(neg_row)
-        neg_def = self.data_processor.get_concept_definition(domain, concept)
+    def __len__(self) -> int:
+        return len(self.batches)
         
-        return (neg_text, neg_def, 1.0)
-
-    def sample_pairs(self, domain: str, concept: str, is_training: bool = True) -> SamplingResult:
-        """Sample positive and negative pairs using parallel processing."""
-        try:
-            with Timer(f"Sampling pairs for {domain}-{concept}"):
-                # Get attributes based on split
-                attributes_df = (
-                    self.data_processor.get_train_attributes() if is_training 
-                    else self.data_processor.get_val_attributes()
-                )
-                
-                # Get all positive attributes
-                mask = (attributes_df['domain'] == domain) & \
-                      (attributes_df['concept'] == concept)
-                positive_attrs = attributes_df[mask]
-                
-                if len(positive_attrs) == 0:
-                    raise ValueError(f"No attributes found for domain={domain}, concept={concept}")
-
-                concept_def = self.data_processor.get_concept_definition(domain, concept)
-                
-                # Create positive pairs in parallel
-                with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
-                    positive_pairs = list(executor.map(
-                        lambda row: (self.data_processor.get_attribute_text(row[1]), concept_def),
-                        positive_attrs.iterrows()
-                    ))
-                
-                n_required_negatives = len(positive_pairs)
-                
-                # Sample hard negatives (40%) and medium negatives (60%) in parallel
-                with ThreadPoolExecutor(max_workers=2) as executor:
-                    n_hard = int(0.4 * n_required_negatives)
-                    hard_future = executor.submit(
-                        self._sample_hard_negatives,
-                        domain, concept, positive_attrs, n_hard, attributes_df
-                    )
-                    
-                    n_medium = n_required_negatives - n_hard
-                    medium_future = executor.submit(
-                        self._sample_medium_negatives,
-                        domain, concept, n_medium, attributes_df
-                    )
-                    
-                    hard_negatives = hard_future.result()
-                    medium_negatives = medium_future.result()
-                
-                # Combine all negatives
-                negative_pairs = hard_negatives + medium_negatives
-                
-                stats = {
-                    'n_positives': len(positive_pairs),
-                    'n_hard_negatives': len(hard_negatives),
-                    'n_medium_negatives': len(medium_negatives)
-                }
-                
-                self.logger.info(
-                    f"Sampled pairs for {domain}-{concept}: "
-                    f"{stats['n_positives']} positives, "
-                    f"{stats['n_hard_negatives']} hard negatives, "
-                    f"{stats['n_medium_negatives']} medium negatives"
-                )
-                
-                return SamplingResult(positive_pairs, negative_pairs, stats)
-                
-        except Exception as e:
-            self.logger.error(f"Error sampling pairs for {domain}-{concept}: {str(e)}")
-            raise
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        batch = self.batches[idx]
+        return batch.to_device(self.device)
 
 class CustomInfoNCELoss(nn.Module):
     def __init__(self, model: SentenceTransformer, temperature: float = 0.07):
         super().__init__()
         self.model = model
         self.temperature = temperature
-        self.scaler = GradScaler()
+        self.cache = {}
         
-    def forward(self, anchors: List[str], positives: List[str], 
-                negatives: List[str], negative_weights: List[float]) -> torch.Tensor:
-        """Compute weighted InfoNCE loss with mixed precision training."""
-        with autocast():
-            # Encode all texts in parallel batches
-            all_texts = anchors + positives + negatives
-            batch_size = 32
-            all_embeddings = []
+    @torch.no_grad()
+    def _get_embeddings(self, texts: List[str]) -> torch.Tensor:
+        """Get embeddings with caching."""
+        uncached_texts = [text for text in texts if text not in self.cache]
+        
+        if uncached_texts:
+            new_embeddings = self.model.encode(
+                uncached_texts,
+                convert_to_tensor=True,
+                batch_size=32
+            )
             
-            for i in range(0, len(all_texts), batch_size):
-                batch = all_texts[i:i + batch_size]
-                with torch.no_grad():
-                    embeddings = self.model.encode(batch, convert_to_tensor=True)
-                    all_embeddings.append(embeddings)
-            
-            all_embeddings = torch.cat(all_embeddings)
-            
-            # Split embeddings
-            n = len(anchors)
-            anchor_embeddings = all_embeddings[:n]
-            positive_embeddings = all_embeddings[n:2*n]
-            negative_embeddings = all_embeddings[2*n:]
-            
-            # Normalize embeddings
-            anchor_embeddings = F.normalize(anchor_embeddings, p=2, dim=1)
-            positive_embeddings = F.normalize(positive_embeddings, p=2, dim=1)
-            negative_embeddings = F.normalize(negative_embeddings, p=2, dim=1)
-            
-            # Compute similarities
-            positive_similarities = torch.sum(
-                anchor_embeddings * positive_embeddings, dim=-1
-            ) / self.temperature
-            
-            negative_similarities = torch.matmul(
-                anchor_embeddings, negative_embeddings.transpose(0, 1)
-            ) / self.temperature
-            
-            # Apply weights to negative similarities
-            negative_weights = torch.tensor(negative_weights).to(negative_similarities.device)
-            negative_similarities = negative_similarities * negative_weights.unsqueeze(0)
-            
-            # Compute InfoNCE loss
-            logits = torch.cat([positive_similarities.unsqueeze(-1), negative_similarities], dim=-1)
-            labels = torch.zeros(len(anchors), dtype=torch.long, device=logits.device)
-            
-            return F.cross_entropy(logits, labels)
+            # Update cache
+            for text, emb in zip(uncached_texts, new_embeddings):
+                self.cache[text] = emb
+                
+        # Get all embeddings from cache
+        return torch.stack([self.cache[text] for text in texts])
+        
+    def forward(self, anchors: List[str], positives: List[str],
+                negatives: List[str], negative_weights: torch.Tensor) -> torch.Tensor:
+        """Compute weighted InfoNCE loss with batched operations."""
+        # Get embeddings using cache
+        anchor_embeddings = self._get_embeddings(anchors)
+        positive_embeddings = self._get_embeddings(positives)
+        negative_embeddings = self._get_embeddings(negatives)
+        
+        # Normalize embeddings
+        anchor_embeddings = F.normalize(anchor_embeddings, p=2, dim=1)
+        positive_embeddings = F.normalize(positive_embeddings, p=2, dim=1)
+        negative_embeddings = F.normalize(negative_embeddings, p=2, dim=1)
+        
+        # Compute similarities in parallel
+        positive_similarities = torch.sum(
+            anchor_embeddings * positive_embeddings, dim=-1
+        ) / self.temperature
+        
+        negative_similarities = torch.matmul(
+            anchor_embeddings, negative_embeddings.transpose(0, 1)
+        ) / self.temperature
+        
+        # Apply weights to negative similarities
+        negative_similarities = negative_similarities * negative_weights.unsqueeze(0)
+        
+        # Compute loss
+        logits = torch.cat([positive_similarities.unsqueeze(-1), negative_similarities], dim=-1)
+        labels = torch.zeros(logits.size(0), dtype=torch.long, device=logits.device)
+        
+        return F.cross_entropy(logits, labels)
 
-class ModelTrainer:
-    def __init__(self, 
+class OptimizedModelTrainer:
+    def __init__(self,
                 model_name: str = 'sentence-transformers/all-mpnet-base-v2',
                 batch_size: int = 32,
                 num_epochs: int = 10,
@@ -519,7 +517,7 @@ class ModelTrainer:
                 temperature: float = 0.07,
                 output_dir: str = './model_output',
                 patience: int = 5,
-                num_workers: int = 4):
+                num_workers: int = multiprocessing.cpu_count()):
         self.model_name = model_name
         self.batch_size = batch_size
         self.num_epochs = num_epochs
@@ -530,110 +528,104 @@ class ModelTrainer:
         self.num_workers = num_workers
         self.logger = logging.getLogger(__name__)
         
-        # Initialize model and move to GPU if available
+        # Initialize model with optimizations
         self.model = SentenceTransformer(model_name)
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model.to(self.device)
         
+        if torch.cuda.is_available():
+            self.model = torch.nn.DataParallel(self.model)
+        
         # Create output directory
         os.makedirs(output_dir, exist_ok=True)
-        
-        # Initialize mixed precision training
-        self.scaler = GradScaler()
 
-    def prepare_batches(self, data_processor: DataProcessor, sampler: PairSampler, 
+    def prepare_batches(self, data_processor: DataProcessor,
+                       sampler: BatchedPairSampler,
                        is_training: bool = True) -> List[TrainingBatch]:
-        """Prepare batches for training or validation using parallel processing."""
+        """Prepare batches in parallel."""
         batches = []
         
+        # Create tasks for parallel processing
+        tasks = [
+            (domain, concept)
+            for domain in data_processor.get_domains()
+            for concept in data_processor.get_concepts_for_domain(domain)
+        ]
+        
         with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
-            futures = []
+            future_to_task = {
+                executor.submit(sampler.sample_pairs, domain, concept, is_training): (domain, concept)
+                for domain, concept in tasks
+            }
             
-            for domain in data_processor.get_domains():
-                for concept in data_processor.get_concepts_for_domain(domain):
-                    futures.append(
-                        executor.submit(
-                            self._prepare_single_batch,
-                            sampler, domain, concept, is_training
-                        )
-                    )
-            
-            for future in futures:
+            for future in tqdm(as_completed(future_to_task), total=len(tasks),
+                             desc="Preparing batches"):
+                domain, concept = future_to_task[future]
                 try:
-                    batch = future.result()
-                    if batch is not None:
-                        batches.append(batch)
+                    result = future.result()
+                    batch = TrainingBatch(
+                        anchors=[result.positive_pairs[0][1]] * len(result.positive_pairs),
+                        positives=[pair[0] for pair in result.positive_pairs],
+                        negatives=[pair[0] for pair in result.negative_pairs],
+                        negative_weights=[pair[2] for pair in result.negative_pairs]
+                    )
+                    batches.append(batch)
                 except Exception as e:
-                    self.logger.error(f"Error preparing batch: {str(e)}")
-                    continue
+                    self.logger.error(f"Error preparing batch for {domain}-{concept}: {str(e)}")
                     
         return batches
 
-    def _prepare_single_batch(self, sampler: PairSampler, domain: str, 
-                            concept: str, is_training: bool) -> Optional[TrainingBatch]:
-        """Prepare a single batch for a domain-concept pair."""
-        try:
-            result = sampler.sample_pairs(domain, concept, is_training)
-            
-            return TrainingBatch(
-                anchors=[result.positive_pairs[0][1]] * len(result.positive_pairs),
-                positives=[pair[0] for pair in result.positive_pairs],
-                negatives=[pair[0] for pair in result.negative_pairs],
-                negative_weights=[pair[2] for pair in result.negative_pairs]
-            )
-            
-        except Exception as e:
-            self.logger.error(f"Error preparing batch for {domain}-{concept}: {str(e)}")
-            return None
-
-    def train_epoch(self, dataloader: DataLoader, loss_fn: CustomInfoNCELoss, 
-                   optimizer: torch.optim.Optimizer, scheduler: torch.optim.lr_scheduler._LRScheduler) -> float:
-        """Train for one epoch using mixed precision training."""
+    def train_epoch(self, dataloader: DataLoader,
+                   loss_fn: CustomInfoNCELoss,
+                   optimizer: torch.optim.Optimizer,
+                   scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None) -> float:
+        """Train for one epoch with optimizations."""
         total_loss = 0
         batch_count = 0
+        
+        # Enable automatic mixed precision
+        scaler = torch.cuda.amp.GradScaler()
         
         with tqdm(dataloader, desc="Training") as pbar:
             for batch in pbar:
                 optimizer.zero_grad()
                 
-                with autocast():
+                # Use automatic mixed precision
+                with torch.cuda.amp.autocast():
                     loss = loss_fn(
-                        batch.anchors,
-                        batch.positives,
-                        batch.negatives,
-                        batch.negative_weights
+                        batch['anchors'],
+                        batch['positives'],
+                        batch['negatives'],
+                        batch['negative_weights']
                     )
                 
-                # Mixed precision backward pass
-                self.scaler.scale(loss).backward()
-                self.scaler.step(optimizer)
-                self.scaler.update()
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
                 
-                scheduler.step()
+                if scheduler:
+                    scheduler.step()
                 
                 total_loss += loss.item()
                 batch_count += 1
-                pbar.set_postfix({
-                    'loss': total_loss / batch_count,
-                    'lr': scheduler.get_last_lr()[0]
-                })
+                pbar.set_postfix({'loss': total_loss / batch_count})
                 
         return total_loss / batch_count
 
     def validate(self, dataloader: DataLoader, loss_fn: CustomInfoNCELoss) -> float:
-        """Run validation using mixed precision."""
+        """Run validation with optimizations."""
         total_loss = 0
         batch_count = 0
         
         self.model.eval()
-        with torch.no_grad(), autocast():
+        with torch.no_grad(), torch.cuda.amp.autocast():
             with tqdm(dataloader, desc="Validation") as pbar:
                 for batch in pbar:
                     loss = loss_fn(
-                        batch.anchors,
-                        batch.positives,
-                        batch.negatives,
-                        batch.negative_weights
+                        batch['anchors'],
+                        batch['positives'],
+                        batch['negatives'],
+                        batch['negative_weights']
                     )
                     
                     total_loss += loss.item()
@@ -643,39 +635,38 @@ class ModelTrainer:
         self.model.train()
         return total_loss / batch_count
 
-    def train(self, data_processor: DataProcessor, sampler: PairSampler) -> None:
-        """Train the model using InfoNCE loss with optimizations."""
+    def train(self, data_processor: DataProcessor, sampler: BatchedPairSampler) -> None:
+        """Train the model with optimizations."""
         try:
             self.logger.info("Preparing training data...")
             
-            # Initialize components
+            # Initialize trackers
             metrics_tracker = MetricsTracker(self.output_dir)
             early_stopping = EarlyStopping(patience=self.patience)
             
-            # Prepare training and validation batches in parallel
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                train_future = executor.submit(self.prepare_batches, data_processor, sampler, True)
-                val_future = executor.submit(self.prepare_batches, data_processor, sampler, False)
-                
-                train_batches = train_future.result()
-                val_batches = val_future.result()
+            # Prepare batches in parallel
+            train_batches = self.prepare_batches(data_processor, sampler, is_training=True)
+            val_batches = self.prepare_batches(data_processor, sampler, is_training=False)
             
             if not train_batches or not val_batches:
                 raise ValueError("No training or validation batches could be prepared")
                 
-            train_dataset = ConceptDataset(train_batches)
-            val_dataset = ConceptDataset(val_batches)
+            # Create datasets with device placement
+            train_dataset = OptimizedDataset(train_batches, self.device)
+            val_dataset = OptimizedDataset(val_batches, self.device)
             
+            # Create dataloaders with optimizations
             train_dataloader = DataLoader(
-                train_dataset, 
-                batch_size=1, 
+                train_dataset,
+                batch_size=self.batch_size,
                 shuffle=True,
                 num_workers=self.num_workers,
                 pin_memory=True
             )
+            
             val_dataloader = DataLoader(
-                val_dataset, 
-                batch_size=1, 
+                val_dataset,
+                batch_size=self.batch_size,
                 shuffle=False,
                 num_workers=self.num_workers,
                 pin_memory=True
@@ -683,14 +674,18 @@ class ModelTrainer:
             
             # Initialize loss and optimizer
             loss_fn = CustomInfoNCELoss(self.model, self.temperature)
-            optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.learning_rate)
+            optimizer = torch.optim.AdamW(
+                self.model.parameters(),
+                lr=self.learning_rate,
+                weight_decay=0.01
+            )
             
-            # Initialize learning rate scheduler
-            scheduler = CosineAnnealingWarmRestarts(
+            # Add learning rate scheduler
+            scheduler = torch.optim.lr_scheduler.OneCycleLR(
                 optimizer,
-                T_0=5,
-                T_mult=2,
-                eta_min=1e-6
+                max_lr=self.learning_rate,
+                epochs=self.num_epochs,
+                steps_per_epoch=len(train_dataloader)
             )
             
             self.logger.info(f"Starting training for {self.num_epochs} epochs...")
@@ -705,7 +700,6 @@ class ModelTrainer:
                 
                 metrics_tracker.add_metric('train_loss', train_loss, epoch)
                 metrics_tracker.add_metric('val_loss', val_loss, epoch)
-                metrics_tracker.add_metric('learning_rate', scheduler.get_last_lr()[0], epoch)
                 
                 # Create training stats
                 stats = TrainingStats(
@@ -723,8 +717,7 @@ class ModelTrainer:
                 self.logger.info(
                     f"Epoch {epoch+1}/{self.num_epochs}, "
                     f"Train Loss: {train_loss:.4f}, "
-                    f"Val Loss: {val_loss:.4f}, "
-                    f"LR: {scheduler.get_last_lr()[0]:.2e}"
+                    f"Val Loss: {val_loss:.4f}"
                 )
                 
                 # Early stopping check
@@ -742,9 +735,7 @@ class ModelTrainer:
             metrics_tracker.save_metrics()
             
             # Load best model if exists
-            if early_stopping.best_model_path:
-                self.model = SentenceTransformer(early_stopping.best_model_path)
-                self.logger.info(f"Loaded best model from {early_stopping.best_model_path}")
+            if early_stopping.best_model_path}")
             else:
                 # Save final model if no best model
                 final_path = os.path.join(self.output_dir, "final-model")
@@ -755,13 +746,13 @@ class ModelTrainer:
             self.logger.error(f"Training error: {str(e)}")
             raise
 
-class ModelPredictor:
+class OptimizedPredictor:
     def __init__(self, 
                 model_path: str,
                 data_processor: DataProcessor,
                 batch_size: int = 32,
                 top_k: int = 3,
-                num_workers: int = 4):
+                num_workers: int = multiprocessing.cpu_count()):
         self.model_path = model_path
         self.data_processor = data_processor
         self.batch_size = batch_size
@@ -769,75 +760,119 @@ class ModelPredictor:
         self.num_workers = num_workers
         self.logger = logging.getLogger(__name__)
         
-        # Load model with CUDA optimization
+        # Load model with optimizations
         try:
             self.model = SentenceTransformer(model_path)
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
             self.model.to(self.device)
-            if self.device.type == 'cuda':
+            
+            if torch.cuda.is_available():
                 self.model = torch.nn.DataParallel(self.model)
+                
         except Exception as e:
             self.logger.error(f"Error loading model: {str(e)}")
             raise
             
-        # Cache concept definitions for faster prediction
-        with Timer("Caching concept definitions"):
-            self.concept_definitions = self._cache_concept_definitions()
+        # Cache concept definitions with parallel processing
+        self.concept_definitions = self._cache_concept_definitions()
+        # Pre-compute concept embeddings
+        self.concept_embeddings = self._precompute_concept_embeddings()
         
-    def _cache_concept_definitions(self) -> Dict[Tuple[str, str], torch.Tensor]:
-        """Cache all domain-concept definition embeddings for faster prediction."""
+    def _cache_concept_definitions(self) -> Dict[Tuple[str, str], str]:
+        """Cache all domain-concept definitions in parallel."""
         definitions = {}
+        tasks = [
+            (domain, concept)
+            for domain in self.data_processor.get_domains()
+            for concept in self.data_processor.get_concepts_for_domain(domain)
+        ]
         
-        with torch.no_grad(), autocast():
-            for domain in self.data_processor.get_domains():
-                for concept in self.data_processor.get_concepts_for_domain(domain):
-                    try:
-                        definition = self.data_processor.get_concept_definition(domain, concept)
-                        embedding = self.model.encode(
-                            definition,
-                            convert_to_tensor=True,
-                            show_progress_bar=False
-                        )
-                        definitions[(domain, concept)] = embedding
-                    except Exception as e:
-                        self.logger.warning(f"Could not cache definition for {domain}-{concept}: {str(e)}")
-                        
+        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+            future_to_task = {
+                executor.submit(
+                    self.data_processor.get_concept_definition,
+                    domain,
+                    concept
+                ): (domain, concept)
+                for domain, concept in tasks
+            }
+            
+            for future in as_completed(future_to_task):
+                domain, concept = future_to_task[future]
+                try:
+                    definition = future.result()
+                    definitions[(domain, concept)] = definition
+                except Exception as e:
+                    self.logger.warning(f"Could not cache definition for {domain}-{concept}: {str(e)}")
+                    
         return definitions
+
+    @torch.no_grad()
+    def _precompute_concept_embeddings(self) -> Dict[Tuple[str, str], torch.Tensor]:
+        """Pre-compute embeddings for all concept definitions."""
+        embeddings = {}
         
+        # Prepare batches of definitions
+        definitions_list = []
+        keys_list = []
+        
+        for (domain, concept), definition in self.concept_definitions.items():
+            definitions_list.append(definition)
+            keys_list.append((domain, concept))
+            
+        # Compute embeddings in batches
+        for i in range(0, len(definitions_list), self.batch_size):
+            batch_definitions = definitions_list[i:i + self.batch_size]
+            batch_keys = keys_list[i:i + self.batch_size]
+            
+            batch_embeddings = self.model.encode(
+                batch_definitions,
+                convert_to_tensor=True,
+                show_progress_bar=False
+            )
+            
+            # Normalize embeddings
+            batch_embeddings = F.normalize(batch_embeddings, p=2, dim=1)
+            
+            # Store in dictionary
+            for key, embedding in zip(batch_keys, batch_embeddings):
+                embeddings[key] = embedding
+                
+        return embeddings
+
+    @torch.no_grad()
     def predict_single(self, attribute_name: str, description: str) -> List[PredictionResult]:
-        """Predict domain-concept for a single attribute using cached embeddings."""
+        """Predict domain-concept for a single attribute with optimizations."""
         try:
+            # Combine attribute text
             attribute_text = f"{attribute_name} {description}"
             
-            # Encode attribute text with mixed precision
-            with torch.no_grad(), autocast():
-                attribute_embedding = self.model.encode(
-                    attribute_text,
-                    convert_to_tensor=True,
-                    show_progress_bar=False
-                )
-                
-                # Compute similarities with all cached concept definitions
-                results = []
-                for (domain, concept), definition_embedding in self.concept_definitions.items():
-                    similarity = torch.nn.functional.cosine_similarity(
-                        attribute_embedding,
-                        definition_embedding,
-                        dim=0
-                    ).item()
-                    
-                    results.append(PredictionResult(domain, concept, similarity))
-                
-                # Sort by confidence and return top-k
-                results.sort(key=lambda x: x.confidence, reverse=True)
-                return results[:self.top_k]
+            # Encode attribute text
+            attribute_embedding = self.model.encode(
+                attribute_text,
+                convert_to_tensor=True,
+                show_progress_bar=False
+            )
+            
+            # Normalize attribute embedding
+            attribute_embedding = F.normalize(attribute_embedding, p=2, dim=0)
+            
+            # Compute similarities with all concept embeddings efficiently
+            results = []
+            for (domain, concept), concept_embedding in self.concept_embeddings.items():
+                similarity = torch.dot(attribute_embedding, concept_embedding).item()
+                results.append(PredictionResult(domain, concept, similarity))
+            
+            # Sort by confidence and return top-k
+            results.sort(key=lambda x: x.confidence, reverse=True)
+            return results[:self.top_k]
             
         except Exception as e:
             self.logger.error(f"Error in single prediction: {str(e)}")
             raise
 
     def predict_batch(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Predict domain-concepts for a batch of attributes using parallel processing."""
+        """Predict domain-concepts for a batch of attributes with parallel processing."""
         try:
             # Validate input
             required_cols = ['attribute_name', 'description']
@@ -848,40 +883,47 @@ class ModelPredictor:
             results = []
             
             # Process in batches with parallel execution
-            with Timer("Batch prediction"):
-                for i in tqdm(range(0, len(df), self.batch_size)):
+            with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+                futures = []
+                
+                for i in range(0, len(df), self.batch_size):
                     batch_df = df.iloc[i:i+self.batch_size]
                     
-                    # Process each row in batch using ThreadPool
-                    with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
-                        futures = []
-                        for _, row in batch_df.iterrows():
-                            futures.append(
-                                executor.submit(
-                                    self.predict_single,
-                                    row['attribute_name'],
-                                    row['description']
-                                )
+                    for _, row in batch_df.iterrows():
+                        futures.append(
+                            executor.submit(
+                                self.predict_single,
+                                row['attribute_name'],
+                                row['description']
                             )
-                        
-                        # Collect results
-                        for future in futures:
-                            predictions = future.result()
-                            if predictions:  # Take top prediction
-                                top_pred = predictions[0]
-                                results.append({
-                                    'predicted_domain': top_pred.domain,
-                                    'predicted_concept': top_pred.concept,
-                                    'confidence': top_pred.confidence
-                                })
-                            else:
-                                results.append({
-                                    'predicted_domain': None,
-                                    'predicted_concept': None,
-                                    'confidence': 0.0
-                                })
+                        )
+                
+                # Collect results with progress bar
+                for future in tqdm(as_completed(futures), total=len(futures), desc="Processing predictions"):
+                    try:
+                        predictions = future.result()
+                        if predictions:
+                            top_pred = predictions[0]
+                            results.append({
+                                'predicted_domain': top_pred.domain,
+                                'predicted_concept': top_pred.concept,
+                                'confidence': top_pred.confidence
+                            })
+                        else:
+                            results.append({
+                                'predicted_domain': None,
+                                'predicted_concept': None,
+                                'confidence': 0.0
+                            })
+                    except Exception as e:
+                        self.logger.error(f"Error processing prediction: {str(e)}")
+                        results.append({
+                            'predicted_domain': None,
+                            'predicted_concept': None,
+                            'confidence': 0.0
+                        })
             
-            # Add predictions to DataFrame
+            # Add predictions to DataFrame efficiently
             result_df = pd.DataFrame(results)
             return pd.concat([df.reset_index(drop=True), result_df], axis=1)
             
@@ -890,60 +932,28 @@ class ModelPredictor:
             raise
 
     def predict_csv(self, input_path: str, output_path: str) -> None:
-        """Predict domain-concepts for attributes in a CSV file with progress tracking."""
+        """Predict domain-concepts for attributes in a CSV file with optimizations."""
         try:
-            with Timer("CSV prediction"):
-                # Read input CSV
-                self.logger.info(f"Reading input CSV from {input_path}")
-                df = pd.read_csv(input_path)
-                
-                # Make predictions
-                self.logger.info(f"Making predictions for {len(df)} rows...")
-                result_df = self.predict_batch(df)
-                
-                # Save results
-                self.logger.info(f"Saving predictions to {output_path}")
-                result_df.to_csv(output_path, index=False)
-                
-                self.logger.info("Prediction complete!")
-                
+            # Read input CSV efficiently
+            self.logger.info(f"Reading input CSV from {input_path}")
+            df = pd.read_csv(input_path)
+            
+            # Make predictions
+            self.logger.info("Making predictions...")
+            result_df = self.predict_batch(df)
+            
+            # Save results efficiently
+            self.logger.info(f"Saving predictions to {output_path}")
+            result_df.to_csv(output_path, index=False)
+            
+            self.logger.info("Prediction complete!")
+            
         except Exception as e:
             self.logger.error(f"Error processing CSV: {str(e)}")
             raise
 
-def predict_interactive(predictor: ModelPredictor):
-    """Interactive prediction mode with improved error handling."""
-    logger = logging.getLogger(__name__)
-    logger.info("Starting interactive prediction mode. Type 'quit' to exit.")
-    
-    while True:
-        try:
-            attribute_name = input("\nEnter attribute name (or 'quit' to exit): ").strip()
-            if attribute_name.lower() == 'quit':
-                break
-                
-            description = input("Enter description: ").strip()
-            
-            with Timer("Interactive prediction"):
-                predictions = predictor.predict_single(attribute_name, description)
-            
-            print("\nPredictions:")
-            print("-" * 50)
-            for i, pred in enumerate(predictions, 1):
-                print(f"{i}. Domain: {pred.domain}")
-                print(f"   Concept: {pred.concept}")
-                print(f"   Confidence: {pred.confidence:.4f}")
-                print("-" * 50)
-                
-        except KeyboardInterrupt:
-            logger.info("Interrupted by user")
-            break
-        except Exception as e:
-            logger.error(f"Error during prediction: {str(e)}")
-            print("An error occurred. Please try again.")
-
 def setup_experiment_dir(base_dir: str, experiment_name: Optional[str] = None) -> Path:
-    """Create and setup experiment directory with timestamp and proper logging."""
+    """Create and setup experiment directory with timestamp."""
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     if experiment_name:
         dir_name = f"{experiment_name}_{timestamp}"
@@ -952,22 +962,15 @@ def setup_experiment_dir(base_dir: str, experiment_name: Optional[str] = None) -
         
     experiment_dir = Path(base_dir) / dir_name
     
-    # Create required subdirectories with parallel execution
-    subdirs = ['models', 'logs', 'metrics', 'predictions', 'checkpoints']
-    with ThreadPoolExecutor(max_workers=len(subdirs)) as executor:
-        futures = [
-            executor.submit(lambda d: (experiment_dir / d).mkdir(parents=True, exist_ok=True))
-            for d in subdirs
-        ]
+    # Create required subdirectories
+    subdirs = ['models', 'logs', 'metrics', 'predictions', 'cache']
+    for subdir in subdirs:
+        (experiment_dir / subdir).mkdir(parents=True, exist_ok=True)
         
-        # Wait for all directories to be created
-        for future in futures:
-            future.result()
-            
     return experiment_dir
 
 def load_and_validate_config(config_path: str) -> Dict[str, Any]:
-    """Load and validate configuration file with enhanced error checking."""
+    """Load and validate configuration file efficiently."""
     try:
         with open(config_path, 'r') as f:
             config = yaml.safe_load(f)
@@ -985,26 +988,52 @@ def load_and_validate_config(config_path: str) -> Dict[str, Any]:
             Path(config['data']['concepts_path'])
         ]
         
-        with ThreadPoolExecutor(max_workers=len(data_paths)) as executor:
-            futures = [
-                executor.submit(lambda p: p.exists())
-                for p in data_paths
-            ]
+        # Check paths in parallel
+        with ThreadPoolExecutor() as executor:
+            path_exists = list(executor.map(lambda p: p.exists(), data_paths))
             
-            # Check all paths exist
-            for path, future in zip(data_paths, futures):
-                if not future.result():
-                    raise FileNotFoundError(f"Data file not found: {path}")
-                    
+        missing_paths = [str(path) for path, exists in zip(data_paths, path_exists) if not exists]
+        if missing_paths:
+            raise FileNotFoundError(f"Data files not found: {missing_paths}")
+                
         return config
         
     except Exception as e:
         logger.error(f"Error in configuration: {str(e)}")
         raise
 
+def predict_interactive(predictor: OptimizedPredictor):
+    """Interactive prediction mode with optimizations."""
+    logger = logging.getLogger(__name__)
+    logger.info("Starting interactive prediction mode. Type 'quit' to exit.")
+    
+    while True:
+        try:
+            attribute_name = input("\nEnter attribute name (or 'quit' to exit): ").strip()
+            if attribute_name.lower() == 'quit':
+                break
+                
+            description = input("Enter description: ").strip()
+            
+            predictions = predictor.predict_single(attribute_name, description)
+            
+            print("\nPredictions:")
+            print("-" * 50)
+            for i, pred in enumerate(predictions, 1):
+                print(f"{i}. Domain: {pred.domain}")
+                print(f"   Concept: {pred.concept}")
+                print(f"   Confidence: {pred.confidence:.4f}")
+                print("-" * 50)
+                
+        except KeyboardInterrupt:
+            break
+        except Exception as e:
+            logger.error(f"Error during prediction: {str(e)}")
+            print("An error occurred. Please try again.")
+
 def main():
-    # Parse command line arguments with validation
-    parser = argparse.ArgumentParser(description='Train or predict with sentence transformer model')
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Train or predict with optimized sentence transformer model')
     parser.add_argument('--config', type=str, help='Path to config YAML file')
     parser.add_argument('--mode', choices=['train', 'predict', 'interactive'], required=True,
                       help='Operation mode: train, predict, or interactive')
@@ -1026,30 +1055,28 @@ def main():
                       help='Fraction of data to use for validation')
     parser.add_argument('--random-state', type=int, default=42,
                       help='Random seed for reproducibility')
-    parser.add_argument('--num-workers', type=int, default=4,
-                      help='Number of worker threads for parallel processing')
+    parser.add_argument('--num-workers', type=int, default=multiprocessing.cpu_count(),
+                      help='Number of worker processes for parallel processing')
     
     args = parser.parse_args()
     
     try:
-        # Initialize data processor with train/test split
-        with Timer("Initializing data processor"):
-            data_processor = DataProcessor(
-                args.attributes, 
-                args.concepts,
-                test_size=args.test_size,
-                random_state=args.random_state,
-                num_workers=args.num_workers
-            )
+        # Set random seeds for reproducibility
+        torch.manual_seed(args.random_state)
+        np.random.seed(args.random_state)
+        
+        # Initialize data processor with optimizations
+        data_processor = DataProcessor(
+            args.attributes, 
+            args.concepts,
+            test_size=args.test_size,
+            random_state=args.random_state
+        )
         
         if args.mode == 'train':
             # Training mode
-            sampler = PairSampler(
-                data_processor, 
-                args.batch_size,
-                num_workers=args.num_workers
-            )
-            trainer = ModelTrainer(
+            sampler = BatchedPairSampler(data_processor, args.batch_size)
+            trainer = OptimizedModelTrainer(
                 batch_size=args.batch_size,
                 num_epochs=args.epochs,
                 output_dir=args.output_dir,
@@ -1065,7 +1092,7 @@ def main():
             if not args.input:
                 raise ValueError("--input required for predict mode")
                 
-            predictor = ModelPredictor(
+            predictor = OptimizedPredictor(
                 model_path=args.model_path,
                 data_processor=data_processor,
                 batch_size=args.batch_size,
@@ -1079,7 +1106,7 @@ def main():
             if not args.model_path:
                 raise ValueError("--model-path required for interactive mode")
                 
-            predictor = ModelPredictor(
+            predictor = OptimizedPredictor(
                 model_path=args.model_path,
                 data_processor=data_processor,
                 batch_size=args.batch_size,
@@ -1093,4 +1120,6 @@ def main():
         raise
 
 if __name__ == "__main__":
-    main()
+    main():
+                self.model = SentenceTransformer(early_stopping.best_model_path)
+                self.logger.info(f"Loaded best model from {early_stopping.best_model_path
