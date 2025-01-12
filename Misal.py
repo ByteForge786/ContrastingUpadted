@@ -1,3 +1,270 @@
+class BatchSiameseDataset(torch.utils.data.Dataset):
+    def __init__(
+        self, 
+        attributes_df: pd.DataFrame,
+        concepts_df: pd.DataFrame,
+        batch_size: int = 64,
+        num_workers: int = 4
+    ):
+        # Validate input dataframes
+        if attributes_df is None or len(attributes_df) == 0:
+            raise ValueError("Attributes DataFrame is empty or None")
+        if concepts_df is None or len(concepts_df) == 0:
+            raise ValueError("Concepts DataFrame is empty or None")
+        
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        
+        # Validate required columns
+        required_attr_cols = ['attribute_name', 'description', 'domain', 'concept']
+        required_concept_cols = ['domain', 'concept', 'concept_definition']
+        
+        missing_attr_cols = [col for col in required_attr_cols if col not in attributes_df.columns]
+        missing_concept_cols = [col for col in required_concept_cols if col not in concepts_df.columns]
+        
+        if missing_attr_cols:
+            raise ValueError(f"Missing columns in attributes DataFrame: {missing_attr_cols}")
+        if missing_concept_cols:
+            raise ValueError(f"Missing columns in concepts DataFrame: {missing_concept_cols}")
+        
+        # Parallel pair creation with efficient memory management
+        self.pairs, self.labels = self._create_pairs_parallel(
+            attributes_df, 
+            concepts_df
+        )
+        
+        # Additional validation
+        if not self.pairs or len(self.pairs) == 0:
+            raise ValueError("No pairs could be generated. Check your input data.")
+    
+    def _create_pairs_parallel(
+        self, 
+        attributes_df: pd.DataFrame, 
+        concepts_df: pd.DataFrame
+    ) -> Tuple[List[Tuple[str, str]], List[float]]:
+        """
+        Parallel pair creation with efficient chunk processing
+        """
+        def process_chunk(attr_chunk, concepts_df):
+            chunk_pairs = []
+            chunk_labels = []
+            
+            for _, attr_row in attr_chunk.iterrows():
+                attribute_text = f"{attr_row['attribute_name']} {attr_row['description']}"
+                
+                for _, concept_row in concepts_df.iterrows():
+                    concept_text = (
+                        f"{concept_row['domain']}-{concept_row['concept']}: "
+                        f"{concept_row['concept_definition']}"
+                    )
+                    
+                    # Label based on domain and concept match
+                    label = 1.0 if (
+                        attr_row['domain'] == concept_row['domain'] and 
+                        attr_row['concept'] == concept_row['concept']
+                    ) else 0.0
+                    
+                    chunk_pairs.append((attribute_text, concept_text))
+                    chunk_labels.append(label)
+            
+            return chunk_pairs, chunk_labels
+        
+        # Ensure we have at least as many workers as chunks
+        num_workers = min(self.num_workers, len(attributes_df))
+        
+        # Split attributes into chunks for parallel processing
+        chunks = np.array_split(attributes_df, num_workers)
+        
+        # Use ThreadPoolExecutor for parallel pair generation
+        all_pairs = []
+        all_labels = []
+        
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            futures = [
+                executor.submit(process_chunk, chunk, concepts_df) 
+                for chunk in chunks if not chunk.empty
+            ]
+            
+            for future in as_completed(futures):
+                pairs, labels = future.result()
+                all_pairs.extend(pairs)
+                all_labels.extend(labels)
+        
+        return all_pairs, all_labels
+
+class SiameseNetwork(nn.Module):
+    def __init__(self, model_name: str = 'sentence-transformers/all-mpnet-base-v2'):
+        super().__init__()
+        # Load pretrained transformer model
+        self.encoder = SentenceTransformer(model_name)
+        
+        # Get embedding dimension
+        embedding_dim = self.encoder.get_sentence_embedding_dimension()
+        
+        # Custom similarity network for batch processing
+        self.similarity_network = nn.Sequential(
+            nn.Linear(embedding_dim * 2, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, 1),
+            nn.Sigmoid()
+        )
+    
+    def encode_batch(self, texts: List[str]) -> torch.Tensor:
+        """
+        Batch encoding with parallel processing
+        Ensures gradient computation and handles large batches efficiently
+        """
+        # Validate input
+        if not texts or len(texts) == 0:
+            raise ValueError("Input texts list is empty")
+        
+        # Encode texts with batch processing
+        embeddings = self.encoder.encode(
+            texts, 
+            convert_to_tensor=True,
+            batch_size=len(texts),  # Use full batch size
+            show_progress_bar=False
+        )
+        
+        # Ensure embeddings have correct dimensions
+        if embeddings.dim() == 1:
+            embeddings = embeddings.unsqueeze(0)
+        
+        # Normalize embeddings
+        return F.normalize(embeddings, p=2, dim=1)
+    
+    def forward(self, text1: List[str], text2: List[str]) -> torch.Tensor:
+        # Validate input
+        if not text1 or not text2:
+            raise ValueError("Input text lists cannot be empty")
+        
+        # Ensure equal length inputs
+        if len(text1) != len(text2):
+            raise ValueError(f"Input lists must have equal length. text1: {len(text1)}, text2: {len(text2)}")
+        
+        # Batch encode both sets of texts
+        batch_embeddings1 = self.encode_batch(text1)
+        batch_embeddings2 = self.encode_batch(text2)
+        
+        # Combine embeddings
+        combined = torch.cat([batch_embeddings1, batch_embeddings2], dim=1)
+        
+        # Compute similarity using learned network
+        similarities = self.similarity_network(combined).squeeze()
+        
+        return similarities
+
+class BatchModelTrainer:
+    def __init__(
+        self, 
+        model_name: str = 'sentence-transformers/all-mpnet-base-v2',
+        batch_size: int = 64,
+        num_epochs: int = 15,
+        learning_rate: float = 1e-4,
+        weight_decay: float = 1e-5,
+        output_dir: str = './model_output'
+    ):
+        # Validate input parameters
+        if batch_size < 1:
+            raise ValueError("Batch size must be at least 1")
+        if num_epochs < 1:
+            raise ValueError("Number of epochs must be at least 1")
+        
+        # Setup logging
+        self.logger = logging.getLogger(__name__)
+        
+        # Setup model with batch-aware architecture
+        self.model = SiameseNetwork(model_name)
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model.to(self.device)
+        
+        # Optimizer and scheduler for batch training
+        self.optimizer = torch.optim.AdamW(
+            self.model.parameters(), 
+            lr=learning_rate, 
+            weight_decay=weight_decay
+        )
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, 
+            mode='max', 
+            factor=0.5, 
+            patience=3
+        )
+        
+        # Training hyperparameters
+        self.batch_size = batch_size
+        self.num_epochs = num_epochs
+        self.output_dir = output_dir
+        
+        # Create output directory
+        os.makedirs(output_dir, exist_ok=True)
+    
+    def train_batch(self, dataloader, criterion):
+        """
+        Batch-aware training method
+        Supports efficient gradient computation and tracking
+        """
+        # Validate dataloader
+        if len(dataloader) == 0:
+            raise ValueError("Empty dataloader. No data to train on.")
+        
+        self.model.train()
+        total_loss = 0
+        correct_predictions = 0
+        total_predictions = 0
+        
+        for batch_text1, batch_text2, batch_labels in tqdm(dataloader, desc="Training"):
+            # Validate batch
+            if len(batch_text1) == 0 or len(batch_text2) == 0:
+                self.logger.warning("Skipping empty batch")
+                continue
+            
+            # Move data to device
+            batch_labels = batch_labels.float().to(self.device)
+            
+            # Zero gradients
+            self.optimizer.zero_grad()
+            
+            # Forward pass with batch processing
+            try:
+                similarities = self.model(batch_text1, batch_text2)
+            except Exception as e:
+                self.logger.error(f"Forward pass error: {e}")
+                continue
+            
+            # Compute loss
+            loss = criterion(similarities, batch_labels)
+            
+            # Backward pass
+            loss.backward()
+            self.optimizer.step()
+            
+            # Update metrics
+            total_loss += loss.item()
+            predictions = (similarities > 0.5).float()
+            correct_predictions += (predictions == batch_labels).sum().item()
+            total_predictions += len(batch_labels)
+        
+        # Compute average metrics
+        if total_predictions == 0:
+            self.logger.warning("No predictions made during training")
+            return 0, 0
+        
+        avg_loss = total_loss / len(dataloader)
+        accuracy = correct_predictions / total_predictions
+        
+        return avg_loss, accuracy
+
+
+
+
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
