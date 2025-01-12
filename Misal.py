@@ -1,4 +1,36 @@
 # First, let's modify the ContrastiveModel class to remove MLP
+
+def _train_epoch(self, train_loader: DataLoader, epoch: int) -> float:
+    """Train for one epoch using explicit negatives."""
+    self.model.train()
+    total_loss = 0
+    
+    with tqdm(train_loader, desc=f"Epoch {epoch + 1}") as pbar:
+        for batch_idx, (anchors, others, labels) in enumerate(pbar):
+            # Get embeddings
+            anchor_embeds = self.model(anchors)
+            other_embeds = self.model(others)
+            
+            # Get positives and negatives based on labels
+            positives = other_embeds[labels == 1]
+            anchors_pos = anchor_embeds[labels == 1]  # Get corresponding anchors
+            negatives = other_embeds[labels == 0]
+            
+            if len(positives) > 0 and len(negatives) > 0:
+                # Compute loss
+                loss = self.criterion(anchors_pos, positives, negatives)
+                
+                # Backward and optimize
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+                
+                # Update metrics
+                total_loss += loss.item()
+                pbar.set_postfix({'loss': total_loss / (batch_idx + 1)})
+            
+    return total_loss / len(train_loader)
+
 class ContrastiveModel(nn.Module):
     """Model using only the sentence transformer encoder."""
     def __init__(self, config: TrainingConfig):
