@@ -1,5 +1,57 @@
 # First, let's modify the ContrastiveModel class to remove MLP
 
+
+def load_and_split_data(self, attributes_path: str, concepts_path: str) -> Tuple[Dict, Dict, Dict]:
+    """Load data and create train/val/test splits with caching."""
+    self.logger.info("Loading datasets...")
+    
+    # Define cache paths
+    cache_dir = "data_cache"
+    os.makedirs(cache_dir, exist_ok=True)
+    train_cache = os.path.join(cache_dir, "train_data.json")
+    val_cache = os.path.join(cache_dir, "val_data.json")
+    test_cache = os.path.join(cache_dir, "test_data.json")
+    
+    # Try to load from cache first
+    if all(os.path.exists(f) for f in [train_cache, val_cache, test_cache]):
+        self.logger.info("Loading from cache...")
+        try:
+            with open(train_cache, 'r') as f:
+                train_data = json.load(f)
+            with open(val_cache, 'r') as f:
+                val_data = json.load(f)
+            with open(test_cache, 'r') as f:
+                test_data = json.load(f)
+            self.logger.info("Successfully loaded from cache!")
+            return train_data, val_data, test_data
+        except Exception as e:
+            self.logger.warning(f"Failed to load cache: {e}. Processing data from scratch...")
+    
+    # If cache doesn't exist or failed to load, process normally
+    self.logger.info("Processing data from scratch...")
+    
+    # Load data
+    attributes_df = pd.read_csv(attributes_path)
+    concepts_df = pd.read_csv(concepts_path)
+    
+    # [Rest of your existing data processing code]
+    
+    # Save to cache
+    self.logger.info("Saving processed data to cache...")
+    try:
+        with open(train_cache, 'w') as f:
+            json.dump(train_data, f)
+        with open(val_cache, 'w') as f:
+            json.dump(val_data, f)
+        with open(test_cache, 'w') as f:
+            json.dump(test_data, f)
+        self.logger.info("Successfully cached processed data!")
+    except Exception as e:
+        self.logger.warning(f"Failed to cache data: {e}")
+    
+    return train_data, val_data, test_data
+
+
 def _validate(self, val_loader: DataLoader) -> float:
     """Validate the model."""
     self.model.eval()
