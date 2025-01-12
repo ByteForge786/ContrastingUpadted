@@ -1,3 +1,48 @@
+class SiameseNetwork(nn.Module):
+    def __init__(self, model_name: str = 'sentence-transformers/all-mpnet-base-v2'):
+        super().__init__()
+        self.encoder = SentenceTransformer(model_name)
+        
+        # Create a neural network layer for final similarity computation
+        self.similarity_layer = nn.Sequential(
+            nn.Linear(self.encoder.get_sentence_embedding_dimension(), 256),
+            nn.ReLU(),
+            nn.Linear(256, 1)
+        )
+        
+    def forward(self, text1: List[str], text2: List[str]) -> torch.Tensor:
+        try:
+            # Convert to tensors with gradient computation
+            embeddings1 = torch.stack([
+                torch.tensor(self.encoder.encode(t, convert_to_tensor=False), requires_grad=True) 
+                for t in text1
+            ])
+            
+            embeddings2 = torch.stack([
+                torch.tensor(self.encoder.encode(t, convert_to_tensor=False), requires_grad=True) 
+                for t in text2
+            ])
+            
+            # Normalize embeddings
+            embeddings1 = F.normalize(embeddings1, p=2, dim=1)
+            embeddings2 = F.normalize(embeddings2, p=2, dim=1)
+            
+            # Compute similarity using learned layer
+            similarities = []
+            for emb1, emb2 in zip(embeddings1, embeddings2):
+                combined = torch.abs(emb1 - emb2)
+                similarity = self.similarity_layer(combined).squeeze()
+                similarities.append(similarity)
+            
+            return torch.stack(similarities)
+        
+        except Exception as e:
+            print(f"Forward pass error: {e}")
+            raise
+
+
+
+
 class BatchedPairSampler:
     # ...
 
