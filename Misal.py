@@ -1,5 +1,47 @@
 # First, let's modify the ContrastiveModel class to remove MLP
+class ContextualEncoder(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        # Pretrained transformer
+        self.encoder = SentenceTransformer(config.model_name)
+        
+        # Additional context understanding layers
+        self.context_projection = nn.Sequential(
+            nn.Linear(self.encoder.get_sentence_embedding_dimension(), 512),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, 256),
+            nn.LayerNorm(256)  # Normalize to stabilize learning
+        )
+    
+    def forward(self, texts):
+        # Get base embeddings with rich context
+        base_embeddings = self.encoder.encode(
+            texts, 
+            convert_to_tensor=True,
+            show_progress_bar=False
+        )
+        
+        # Add contextual understanding projection
+        contextual_embeddings = self.context_projection(base_embeddings)
+        
+        return F.normalize(contextual_embeddings, p=2, dim=1)
 
+class AdvancedContrastiveLoss(nn.Module):
+    def __init__(self, temperature=0.1, margin=0.5):
+        super().__init__()
+        self.temperature = temperature
+        self.margin = margin
+    
+    def forward(self, anchors, positives, negatives):
+        # Compute similarities with margin
+        pos_similarities = torch.sum(anchors * positives, dim=1) / self.temperature
+        neg_similarities = torch.sum(anchors * negatives, dim=1) / self.temperature
+        
+        # Triplet-like loss mechanism
+        loss = F.relu(neg_similarities - pos_similarities + self.margin)
+        
+        return loss.mean()
 
 def load_and_split_data(self, attributes_path: str, concepts_path: str) -> Tuple[Dict, Dict, Dict]:
     """Load data and create train/val/test splits with caching."""
