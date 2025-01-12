@@ -1,3 +1,38 @@
+def evaluate_test(self, test_data: Dict, output_dir: str) -> None:
+    """Evaluate model on test set and save metrics."""
+    self.logger.info("Evaluating on test set...")
+    
+    # Create test dataset and loader
+    test_dataset = ContrastiveDataset(**test_data)
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=self.config.batch_size,
+        shuffle=False,
+        num_workers=self.config.num_workers,
+        pin_memory=True
+    )
+    
+    # Get test loss
+    test_loss = self._validate(test_loader)
+    
+    # Calculate additional metrics
+    metrics = {
+        'test_loss': test_loss,
+        'timestamp': datetime.now().strftime("%Y%m%d_%H%M%S")
+    }
+    
+    # Save metrics
+    metrics_path = os.path.join(output_dir, 'test_metrics.json')
+    with open(metrics_path, 'w') as f:
+        json.dump(metrics, f, indent=2)
+        
+    self.logger.info(f"Test Loss: {test_loss:.4f}")
+    self.logger.info(f"Saved test metrics to {metrics_path}")
+
+
+
+
+
 class BatchSiameseDataset(torch.utils.data.Dataset):
     def __init__(
         self, 
